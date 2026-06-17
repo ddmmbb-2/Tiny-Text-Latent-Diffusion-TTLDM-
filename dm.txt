@@ -1,0 +1,183 @@
+# V30 架構規劃書：微型文字潛在擴散模型（Tiny Text Latent Diffusion Model, TTLDM）
+
+---
+
+## 1. 專案概述
+
+**代號**：`D2-Diffuser` / `v30`  
+**目標**：在 **12 GB VRAM** 的消費級硬體上，驗證一個同時具備以下特性的全新 LLM 架構：
+- **接近無限的上下文輸入**（線性複雜度，可處理數萬 token）
+- **一口氣生成**（透過離散擴散或潛在擴散方式並行解碼，不採用自迴歸逐 token 生成）
+
+**定位**：這是一個微型驗證模型（~12M 參數），目標並非追求 SOTA 品質，而是**打穿技術路徑**，證明「雙向狀態空間 + 潛在擴散」在文字生成上的可行性。
+
+---
+
+## 2. 設計理念
+
+傳統自迴歸 Transformer 有兩大瓶頸：
+1. **二次複雜度的注意力機制**，難以擴展至超長上下文。
+2. **逐 token 生成**，速度受限，且無法像繪圖 AI 一樣「一口氣」產出完整內容。
+
+V30 的解法：
+- **Bi-Mamba 雙向狀態空間模型**：提供線性時間、空間複雜度的序列建模，且透過雙向掃描獲得完整上下文，適合當作長文本的編碼器與去噪骨幹。
+- **潛在壓縮（Perceiver-style）**：將可變長度序列壓縮為固定數量的潛在向量，大幅降低後續擴散去噪的計算量，實現「長輸入、短潛在、快速生成」。
+- **連續潛在空間擴散**：在壓縮後的潛在空間上執行標準高斯擴散（DDPM/DDIM），用小型 1D UNet 預測噪聲，推理時逐步去噪後再由解碼器還原為文字。這避免了直接在離散 token 空間做擴散的收斂困難與高複雜度。
+
+這個設計借鑒了 Stable Diffusion 的「VAE + UNet」架構，並將其遷移到文本領域。
+
+---
+
+## 3. 模型架構
+
+```
+輸入文本 (Token IDs)
+       │
+       ▼
+  Embedding + Bi-Mamba Encoder (4 層)
+       │
+       ▼
+  ContextCompressor (Cross-Attention, 64 個可學習查詢向量)
+       │
+       ▼
+ 潛在向量 z (固定大小 64 × 256)
+       │
+       ▼
+  [訓練時：擴散去噪]   [推理時：DDIM 取樣]
+       │
+       ▼
+ 去噪後潛在向量 ẑ (64 × 256)
+       │
+       ▼
+  LatentDecoder (Transformer Decoder, 4 層, 含 cross-attention)
+       │
+       ▼
+ 輸出文本 (Token IDs)
+```
+
+### 核心組件
+
+1. **Bi-Mamba Encoder**  
+   - 每一層由一個正向 Mamba 和一個反向 Mamba 組成，輸出相加後通過 SwiGLU FFN。  
+   - 無位置編碼，雙向掃描自身提供位置感知。
+
+2. **ContextCompressor**  
+   - 使用 Perceiver-style 的交叉注意力，以一組可學習的潛在查詢向量（64 個）從 Encoder 輸出中提取固定大小的表徵。  
+   - 輸出形狀為 `(B, 64, 256)`。
+
+3. **Latent Decoder**  
+   - 4 層 Transformer Decoder，與壓縮後的潛在向量進行交叉注意力，以自迴歸方式生成目標文本（訓練時使用 teacher forcing，推理時逐 token 生成）。  
+   - 帶有可學習的位置編碼，輸出層與嵌入層共享權重。
+
+4. **Latent Diffusion UNet (第二階段)**  
+   - 1D 卷積 UNet，在 64 個潛在向量上進行去噪。  
+   - 包含時間步嵌入（Sinusoidal + MLP），並使用殘差塊（ResBlock1D）進行特徵變換。  
+   - 預測加入的噪聲，損失函數為 MSE。
+
+---
+
+## 4. 超參數與規模
+
+| 參數 | 值 | 說明 |
+|------|-----|------|
+| `vocab_size` | 16384 | 沿用 BPE tokenizer v12 |
+| `d_model` | 256 | 全模型統一隱藏維度 |
+| `num_latents` (K) | 64 | 壓縮後的潛在向量數量 |
+| `encoder_layers` | 4 | Bi-Mamba 層數 |
+| `decoder_layers` | 4 | Transformer Decoder 層數 |
+| `mamba_expand` | 2 | Mamba 內部擴展倍數 |
+| `mamba_d_state` | 16 | 狀態空間維度 |
+| `unet_dim` | 256 | UNet 基礎通道數 |
+| `unet_down_up_layers` | 各 2 次下採樣/上採樣 | 總共 4 個 ResBlock |
+| `diffusion_steps` | 1000 (訓練) / 50 (DDIM 推理) | 噪聲排程：cosine schedule |
+| `max_seq_len` (訓練) | 512→2048 | 逐步增加 |
+| `batch_size` | 8 | 12 GB VRAM 可承受 |
+| `learning_rate` | 1e-3 (AE 階段) | AdamW, weight_decay=0.01 |
+| **總參數量** | **~12M** | 符合微型驗證目標 |
+
+---
+
+## 5. 訓練計畫
+
+### 階段 1：Autoencoder 預訓練（文字重建）
+- **目的**：讓 Encoder + Compressor + Decoder 學會將文本壓縮成 64 個潛在向量，並能重建回原文。
+- **資料**：`corpus_v24_knowledge.bin`（16 萬 token 問答語料），序列長度 512。
+- **損失**：Cross-Entropy（decoder 輸出 vs. 輸入文本）。
+- **訓練步數**：約 10K～20K steps，直到重建 loss 穩定下降（< 2.5）。
+- **產出**：`autoencoder_stage1.pth`（包含完整 AE 權重）。
+
+### 階段 2：潛在擴散模型訓練（Diffusion Prior）
+- **目的**：固定 AE 的 Encoder+Compressor，訓練 1D UNet 在潛在空間上去噪。
+- **資料**：與階段 1 相同。每次取樣文本，計算其潛在向量 z0，加入高斯噪聲得 zt，訓練 UNet 預測噪聲。
+- **損失**：MSE(pred_noise, noise)。
+- **訓練步數**：約 20K～50K steps。
+- **產出**：`diffusion_unet.pth`。
+
+### 階段 3（可選）：聯合微調
+- 解凍全部參數，以較低學習率（如 1e-5）進行端到端微調，提升生成品質。
+
+---
+
+## 6. 推理管線
+
+1. **壓縮**：輸入長文本 → Encoder → Compressor → 得到固定的 64 個潛在向量（可保存或直接進入生成）。
+2. **生成**：
+   - 從標準高斯噪聲取樣 `z_T` (形狀 64×256)
+   - 使用 DDIM 排程，迭代 50 步，每一步用 UNet 預測噪聲並更新 `z_t`
+   - 得到乾淨的潛在向量 ẑ
+3. **解碼**：將 ẑ 餵入 Decoder，自迴歸生成最終文本（可設定最大輸出長度，如 128 token）。
+
+---
+
+## 7. 硬體需求評估（12 GB VRAM）
+
+- 模型權重：bf16 精度約 24 MB
+- 優化器狀態（AdamW）：約 72 MB
+- 激活值（估算）：  
+  - Encoder (B=8, L=2048, d=256)：約 67 MB  
+  - Compressor (B=8, K=64, L=2048)：約 1 MB  
+  - Decoder (B=8, T=512)：約 4 MB  
+  - UNet (B=8, K=64)：極小  
+  - **總計 < 200 MB**，完全在 12 GB 範圍內，還有大量餘裕可增加 batch size 或序列長度。
+
+---
+
+## 8. 與 V24 的關係及繼承
+
+- 復用基礎組件：`RMSNorm`, `SwiGLU`, 簡化 Mamba 結構（修改為雙向）。
+- 沿用相同的 BPE tokenizer（`bpe_tokenizer_v12.json`）和詞表大小（16384）。
+- 訓練資料沿用 `corpus_v24_knowledge.bin`，但為適應長上下文將進行拼接或合成擴充。
+- V24 的 `ResonanceOptimizerCore` 等複雜模組不再使用，架構全新設計。
+
+---
+
+## 9. 風險與緩解策略
+
+| 風險 | 影響 | 緩解措施 |
+|------|------|----------|
+| 小數據（16 萬 token）導致過擬合 | AE 重建尚可，但泛化差 | 使用大量 dropout、weight decay；必要時用 V24 模型合成更多數據 |
+| Decoder 自迴歸部分仍為速度瓶頸 | 生成速度不如預期 | 後續可將 Decoder 改為非自迴歸（如 Mask-Predict）或使用 KV Cache |
+| 雙向 Mamba 訓練不穩定 | loss 不收斂 | 降低學習率，嘗試標準 Transformer 層作為 fallback |
+| 潛在空間擴散無法捕捉細節 | 生成文字不流暢 | 增加潛在向量數量（如 128）或調整 diffusion schedule |
+| 長文本壓縮時資訊遺失 | 還原內容失真 | 增大潛在向量數量、增加 Encoder 層數，或使用層級壓縮 |
+
+---
+
+## 10. 時程規劃（參考）
+
+- **第 1 週**：實作並開始訓練 Autoencoder，確認重建 loss 下降。
+- **第 2 週**：完成 AE 訓練，開始訓練 Diffusion UNet，同時準備長文本測試資料。
+- **第 3 週**：完成 Diffusion 訓練，實作 DDIM 推理管線，進行生成品質初步評估。
+- **第 4 週**：壓力測試（長上下文輸入、多樣生成），調整超參數，撰寫實驗報告。
+
+---
+
+## 11. 檔案與版本
+
+- 規劃書版本：v1.0
+- 對應程式碼：`train_autoencoder_stage1.py`、`train_diffusion_stage2.py`、`inference_v30.py`
+- 權重保存：`autoencoder_stage1.pth`、`diffusion_unet.pth`
+
+---
+
+*本文件作為 V30 專案的技術藍圖，將隨開發進展持續更新。*

@@ -195,7 +195,7 @@ class TextAutoencoder(nn.Module):
 # ==================== 設定參數與執行環境 ====================
 config = {
     "vocab_path": "bpe_tokenizer_v13.json", 
-    "bin_path": "corpus_v24_knowledge.bin",
+    "bin_path": "v30.bin",
     "vocab_size": 16385,
     "d_model": 256,
     "num_latents": 64,
