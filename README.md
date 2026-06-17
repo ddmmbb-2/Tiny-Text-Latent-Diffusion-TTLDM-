@@ -32,7 +32,6 @@
 ## 🏗️ 模型架構 (Architecture)
 
 
-```
 
 輸入文本 (Token IDs)
 │
