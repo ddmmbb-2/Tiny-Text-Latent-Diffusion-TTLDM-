@@ -51,7 +51,7 @@ Non-Autoregressive Latent Decoder (4 層 Transformer Decoder)
 ▼
 輸出文本 (Token IDs 一口氣並行平行輸出)
 
-```
+
 
 ---
 
@@ -80,7 +80,7 @@ Non-Autoregressive Latent Decoder (4 層 Transformer Decoder)
   ```bash
   python v30.py
 
-```
+
 
 ### 📉 階段 2：潛在空間擴散訓練（Diffusion Prior）—— *Coming Soon*
 
